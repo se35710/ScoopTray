@@ -348,6 +348,7 @@ function Invoke-ScoopCommand {
         return
     }
     $script:UpdateRunning = $true
+    Set-TrayTooltip "Scoop Tray`nRunning: scoop $Arguments"
     Rebuild-ContextMenu
     Write-Log "Launching: scoop $Arguments"
 
@@ -431,13 +432,13 @@ function Rebuild-ContextMenu {
     [void]$menu.Items.Add($miCheck)
 
     $miUpdateBuckets = [System.Windows.Forms.ToolStripMenuItem]::new()
-    $miUpdateBuckets.Text    = 'Update Buckets  (scoop update)'
+    $miUpdateBuckets.Text    = if ($script:UpdateRunning -and ($script:_updateArgs -eq 'update')) { 'Updating Buckets…' } else { 'Update Buckets  (scoop update)' }
     $miUpdateBuckets.Enabled = !$busy
     $miUpdateBuckets.Add_Click({ Invoke-ScoopCommand -Arguments 'update' -Description 'Updating buckets' })
     [void]$menu.Items.Add($miUpdateBuckets)
 
     $miUpdateAll = [System.Windows.Forms.ToolStripMenuItem]::new()
-    $miUpdateAll.Text    = 'Update All Apps  (scoop update *)'
+    $miUpdateAll.Text    = if ($script:UpdateRunning -and ($script:_updateArgs -eq 'update *')) { 'Updating Apps…' } else { 'Update All Apps  (scoop update *)' }
     $miUpdateAll.Enabled = !$busy
     $miUpdateAll.Add_Click({ Invoke-ScoopCommand -Arguments 'update *' -Description 'Updating all apps' })
     [void]$menu.Items.Add($miUpdateAll)
