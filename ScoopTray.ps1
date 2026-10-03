@@ -89,9 +89,11 @@ Write-Log "Loading Scoop libs from: $libDir" -Level DEBUG
 . (Join-Path $libDir 'versions.ps1')
 Write-Log 'Scoop libs loaded' -Level DEBUG
 
-# Override $scoopdir / $globaldir so Scoop lib functions resolve correctly
-$scoopdir  = $script:ScoopDir
-$globaldir = $null   # we only track per-user installs here
+# Override $scoopdir / $bucketsdir / $globaldir so Scoop lib functions resolve correctly
+# Must be set AFTER dot-sourcing — core.ps1 and buckets.ps1 set these at module level.
+$scoopdir   = $script:ScoopDir
+$bucketsdir = $script:BucketsDir
+$globaldir  = $null   # we only track per-user installs here
 
 # ── helper: draw a coloured circle icon on-the-fly ───────────────────────────
 function New-TrayIcon {
@@ -140,6 +142,7 @@ $script:UpdateRunning  = $false
 function Start-ScoopCheck {
     if ($script:CheckRunning) { return }
     $script:CheckRunning = $true
+    Rebuild-ContextMenu
 
     $script:NotifyIcon.Icon = New-TrayIcon -Color Gray
 
@@ -162,19 +165,23 @@ function Start-ScoopCheck {
 
     [void]$ps.AddScript({
         # ── load Scoop libs ──────────────────────────────────────────────────
-        $libDir   = Join-Path $scoopApp 'lib'
-        $scoopdir = $scoopDir           # required by Scoop lib globals
+        $libDir    = Join-Path $scoopApp 'lib'
         $globaldir = $null
         . (Join-Path $libDir 'core.ps1')
         . (Join-Path $libDir 'buckets.ps1')
         . (Join-Path $libDir 'json.ps1')
         . (Join-Path $libDir 'manifest.ps1')
         . (Join-Path $libDir 'versions.ps1')
+        # core.ps1 sets $scoopdir at module level and would overwrite anything
+        # set before the dot-source, so we override it here, after loading.
+        $scoopdir     = $scoopDir
+        $bucketsdir   = $bucketsDir   # buckets.ps1 also sets this at module level
 
         $result = [pscustomobject]@{
             BucketsBehind = [System.Collections.Generic.List[string]]::new()
             OutdatedApps  = [System.Collections.Generic.List[pscustomobject]]::new()
             Errors        = [System.Collections.Generic.List[string]]::new()
+            Log           = [System.Collections.Generic.List[string]]::new()
         }
 
         # ── check each bucket for unpulled commits ───────────────────────────
@@ -235,16 +242,25 @@ function Start-ScoopCheck {
 
     $handle = $ps.BeginInvoke()
 
-    # Poll for completion on a timer instead of blocking the UI thread
-    $pollTimer          = [System.Windows.Forms.Timer]::new()
-    $pollTimer.Interval = 500
-    $pollTimer.Add_Tick({
-        if ($handle.IsCompleted) {
-            $pollTimer.Stop()
-            $pollTimer.Dispose()
+    # Poll for completion on a timer instead of blocking the UI thread.
+    # Store on $script: so the GC cannot collect it before it fires.
+    $script:_pollTimer          = [System.Windows.Forms.Timer]::new()
+    $script:_pollTimer.Interval = 500
+
+    # Capture locals into named script-scope vars so the closure can reach them.
+    $script:_pollPs     = $ps
+    $script:_pollRs     = $rs
+    $script:_pollHandle = $handle
+
+    $script:_pollTimer.Add_Tick({
+        if ($script:_pollHandle.IsCompleted) {
+            $script:_pollTimer.Stop()
+            $script:_pollTimer.Dispose()
 
             try {
-                $checkResult = $ps.EndInvoke($handle)
+                $raw = $script:_pollPs.EndInvoke($script:_pollHandle)
+                # EndInvoke returns a PSDataCollection; the result object is element [0]
+                $checkResult = if ($raw -and $raw.Count -gt 0) { $raw[0] } else { $null }
                 if ($checkResult) {
                     # Replay log lines from the runspace to the console
                     foreach ($line in $checkResult.Log) {
@@ -267,8 +283,8 @@ function Start-ScoopCheck {
             } catch {
                 Write-Log "Error collecting check results: $_" -Level ERROR
             }
-            $ps.Dispose()
-            $rs.Dispose()
+            $script:_pollPs.Dispose()
+            $script:_pollRs.Dispose()
 
             $script:LastChecked  = Get-Date
             $script:CheckRunning = $false
@@ -276,7 +292,7 @@ function Start-ScoopCheck {
             Update-TrayState
         }
     })
-    $pollTimer.Start()
+    $script:_pollTimer.Start()
 }
 
 # ── update tray icon + tooltip + balloon based on current state ───────────────
@@ -332,37 +348,37 @@ function Invoke-ScoopCommand {
         return
     }
     $script:UpdateRunning = $true
+    Rebuild-ContextMenu
     Write-Log "Launching: scoop $Arguments"
 
-    $scoopExe = Join-Path $script:ScoopApp 'bin\scoop.ps1'
-
-    # Build a self-contained script block that runs in a new window so the
-    # user can see progress; we pass all output back via a temp file.
-    $tmpLog = [System.IO.Path]::GetTempFileName()
-    $cmd    = "powershell.exe -NoLogo -ExecutionPolicy Bypass -Command `"& '$scoopExe' $Arguments *>&1 | Tee-Object -FilePath '$tmpLog'`""
+    $scoopExe  = Join-Path $script:ScoopApp 'bin\scoop.ps1'
+    # Use the same PowerShell host that is currently running so the child
+    # process inherits the same version (and all its built-in cmdlets).
+    $psExe     = [System.Diagnostics.Process]::GetCurrentProcess().MainModule.FileName
 
     $procInfo             = [System.Diagnostics.ProcessStartInfo]::new()
-    $procInfo.FileName    = 'powershell.exe'
-    $procInfo.Arguments   = "-NoLogo -ExecutionPolicy Bypass -Command `"& '$scoopExe' $Arguments *>&1 | Tee-Object -FilePath '$tmpLog'`""
+    $procInfo.FileName    = $psExe
+    $procInfo.Arguments   = "-NoLogo -ExecutionPolicy Bypass -File `"$scoopExe`" $Arguments"
     $procInfo.WindowStyle = [System.Diagnostics.ProcessWindowStyle]::Normal
-    $proc                 = [System.Diagnostics.Process]::Start($procInfo)
+    $script:_updateProc   = [System.Diagnostics.Process]::Start($procInfo)
 
-    # Poll for process exit, then trigger a new check
-    $waitTimer          = [System.Windows.Forms.Timer]::new()
-    $waitTimer.Interval = 1000
-    $waitTimer.Add_Tick({
-        if ($proc.HasExited) {
-            $waitTimer.Stop()
-            $waitTimer.Dispose()
+    # Store on $script: so the GC cannot collect the timer or process before the tick fires.
+    $script:_updateArgs  = $Arguments
+    $script:_waitTimer   = [System.Windows.Forms.Timer]::new()
+    $script:_waitTimer.Interval = 1000
+    $script:_waitTimer.Add_Tick({
+        if ($script:_updateProc.HasExited) {
+            $script:_waitTimer.Stop()
+            $script:_waitTimer.Dispose()
             $script:UpdateRunning = $false
-            Write-Log ("scoop $Arguments exited with code $($proc.ExitCode)") -Level $(
-                if ($proc.ExitCode -eq 0) { 'OK' } else { 'WARN' })
+            Write-Log ("scoop $($script:_updateArgs) exited with code $($script:_updateProc.ExitCode)") -Level $(
+                if ($script:_updateProc.ExitCode -eq 0) { 'OK' } else { 'WARN' })
             # Small delay to let file system settle
             [System.Threading.Thread]::Sleep(500)
             Start-ScoopCheck
         }
     })
-    $waitTimer.Start()
+    $script:_waitTimer.Start()
 }
 
 # ── context menu builder ──────────────────────────────────────────────────────
@@ -381,11 +397,9 @@ function Rebuild-ContextMenu {
     if ($script:OutdatedApps.Count -gt 0) {
         $appsMenu      = [System.Windows.Forms.ToolStripMenuItem]::new()
         $appsMenu.Text = "⚠  $($script:OutdatedApps.Count) outdated app(s)"
-        $appsMenu.Enabled = $false
         foreach ($a in $script:OutdatedApps) {
             $item      = [System.Windows.Forms.ToolStripMenuItem]::new()
             $item.Text = "   $($a.Name)  $($a.Installed) → $($a.Latest)"
-            $item.Enabled = $false
             [void]$appsMenu.DropDownItems.Add($item)
         }
         [void]$menu.Items.Add($appsMenu)
@@ -395,11 +409,9 @@ function Rebuild-ContextMenu {
     if ($script:BucketsBehind.Count -gt 0) {
         $buckMenu      = [System.Windows.Forms.ToolStripMenuItem]::new()
         $buckMenu.Text = "↓  $($script:BucketsBehind.Count) bucket(s) behind"
-        $buckMenu.Enabled = $false
         foreach ($b in $script:BucketsBehind) {
             $item      = [System.Windows.Forms.ToolStripMenuItem]::new()
             $item.Text = "   $b"
-            $item.Enabled = $false
             [void]$buckMenu.DropDownItems.Add($item)
         }
         [void]$menu.Items.Add($buckMenu)
@@ -410,20 +422,23 @@ function Rebuild-ContextMenu {
     }
 
     # ── actions ───────────────────────────────────────────────────────────────
+    $busy = $script:CheckRunning -or $script:UpdateRunning
+
     $miCheck = [System.Windows.Forms.ToolStripMenuItem]::new()
-    $miCheck.Text = 'Check for Updates'
+    $miCheck.Text    = if ($script:CheckRunning) { 'Checking…' } else { 'Check for Updates' }
+    $miCheck.Enabled = !$busy
     $miCheck.Add_Click({ Start-ScoopCheck })
     [void]$menu.Items.Add($miCheck)
 
     $miUpdateBuckets = [System.Windows.Forms.ToolStripMenuItem]::new()
     $miUpdateBuckets.Text    = 'Update Buckets  (scoop update)'
-    $miUpdateBuckets.Enabled = !$script:UpdateRunning
+    $miUpdateBuckets.Enabled = !$busy
     $miUpdateBuckets.Add_Click({ Invoke-ScoopCommand -Arguments 'update' -Description 'Updating buckets' })
     [void]$menu.Items.Add($miUpdateBuckets)
 
     $miUpdateAll = [System.Windows.Forms.ToolStripMenuItem]::new()
     $miUpdateAll.Text    = 'Update All Apps  (scoop update *)'
-    $miUpdateAll.Enabled = !$script:UpdateRunning -and ($script:OutdatedApps.Count -gt 0)
+    $miUpdateAll.Enabled = !$busy
     $miUpdateAll.Add_Click({ Invoke-ScoopCommand -Arguments 'update *' -Description 'Updating all apps' })
     [void]$menu.Items.Add($miUpdateAll)
 
@@ -562,7 +577,29 @@ Rebuild-ContextMenu
 # Kick off an immediate check on startup
 Start-ScoopCheck
 
+# ── Ctrl+C / SIGINT handler — clean up the tray icon before exiting ───────────
+if ($script:HasConsole) {
+    Register-ObjectEvent -InputObject ([Console]) -EventName CancelKeyPress `
+        -Action {
+            $EventArgs.Cancel = $true   # don't kill the process immediately
+            Write-Log 'Ctrl+C received – shutting down cleanly' -Level WARN
+            $script:AutoCheckTimer.Stop()
+            $script:NotifyIcon.Visible = $false
+            $script:NotifyIcon.Dispose()
+            [System.Windows.Forms.Application]::Exit()
+        } | Out-Null
+}
+
 # ── message pump ──────────────────────────────────────────────────────────────
 Write-Log 'Entering message pump (UI thread)' -Level DEBUG
-[System.Windows.Forms.Application]::Run()
-Write-Log 'Message pump exited' -Level DEBUG
+try {
+    [System.Windows.Forms.Application]::Run()
+} finally {
+    # Guarantee the icon is removed even if the pump exits unexpectedly
+    $script:AutoCheckTimer.Stop()
+    if ($script:NotifyIcon.Visible) {
+        $script:NotifyIcon.Visible = $false
+        $script:NotifyIcon.Dispose()
+    }
+    Write-Log 'Message pump exited' -Level DEBUG
+}
