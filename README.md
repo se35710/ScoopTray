@@ -62,9 +62,9 @@ README.md
 | *Last checked: HH:mm:ss* | Status header (non-clickable) |
 | ⚠ N outdated app(s) | Expandable list of app → installed → latest |
 | ↓ N bucket(s) behind | Expandable list of bucket names |
-| **Check for Updates** | Runs an immediate background check |
-| **Update Buckets** | `scoop update` — pulls latest manifests |
-| **Update All Apps** | `scoop update *` — only enabled when outdated apps exist |
+| **Check for Updates** / *Checking…* | Runs an immediate background check; label changes while running |
+| **Update Buckets** / *Updating Buckets…* | `scoop update` — pulls latest manifests; label changes while running |
+| **Update All Apps** / *Updating Apps…* | `scoop update *` — updates all apps; label changes while running |
 | **Auto-check interval** | Sub-menu to set / disable the periodic check |
 | **Open Scoop Directory** | Opens `%USERPROFILE%\scoop` in Explorer |
 | **View Installed Apps** | Opens the app-list dialog |
@@ -83,9 +83,14 @@ The background check runs in a separate **Runspace** so the UI thread is never
 blocked. A lightweight `Timer` polls for completion and marshals the result back
 to the UI thread before updating the icon and menu.
 
-Actual update commands are spawned as a **separate `powershell.exe` process** with
-a visible console window so you can watch the progress in real time. Once the
-process exits, a fresh check is triggered automatically.
+Actual update commands are spawned as a **separate process using the same PowerShell
+host** that launched ScoopTray (ensuring the correct version and all built-in cmdlets
+are available) with a visible console window so you can watch the progress in real
+time. Once the process exits, a fresh check is triggered automatically.
+
+While any operation is in progress (check or update) all three action menu items are
+disabled and the active item's label changes to show what is running. The tray tooltip
+also updates to show the currently running command.
 
 ---
 
